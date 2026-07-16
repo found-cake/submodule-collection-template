@@ -76,6 +76,8 @@ Settings → General → Features → Issues
 
 Enable `Issues` if it is disabled.
 
+For a managed collection, select `Collaborators only` from the dropdown next to `Issues`. This prevents outside users from opening request issues and triggering preview workflow runs. The restriction applies to every new issue in the repository, not only the submodule request form. See [GitHub's Issues setting documentation](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/disabling-issues).
+
 ### 3. Grant GitHub Actions write permissions
 
 Open:
@@ -107,6 +109,7 @@ The form contains these fields:
 | Parent path | Yes | Parent directory for the submodule. Use `.` for the repository root |
 | Directory name | No | Uses the repository name when left empty |
 | Branch | No | Uses the remote repository's default branch when left empty |
+| Confirmation | Yes | Confirms that the repository and parent path were reviewed |
 
 Example:
 
@@ -115,6 +118,7 @@ Repository: example/example
 Parent path: collections
 Directory name: example
 Branch: main
+Confirmation: checked
 ```
 
 Resulting path:
@@ -248,6 +252,9 @@ Customize behavior in `.github/submodule-manager.json`:
   "allowed_hosts": [
     "github.com"
   ],
+  "authenticated_hosts": [
+    "github.com"
+  ],
   "allow_root": true,
   "portable_paths": true,
   "prevent_duplicate_repository": true,
@@ -269,6 +276,22 @@ A list of HTTPS Git hosts that requests may use.
 ```
 
 The `owner/repository` shorthand always resolves to `github.com`. Use a complete HTTPS URL for another host.
+
+### `authenticated_hosts`
+
+The subset of `allowed_hosts` that may receive `SUBMODULE_TOKEN`. The default contains only `github.com`; keep a public custom host out of this list. Add a private custom host explicitly only when the token is scoped for that host.
+
+```json
+{
+  "allowed_hosts": [
+    "github.com",
+    "git.example.com"
+  ],
+  "authenticated_hosts": [
+    "github.com"
+  ]
+}
+```
 
 ### `allow_root`
 
@@ -292,7 +315,7 @@ For example, when `Collections/Example` already exists, `collections/example` is
 
 The default `GITHUB_TOKEN` is limited to the collection repository and may not be able to read another private repository.
 
-To add private repositories, create a `SUBMODULE_TOKEN` Actions secret in the collection repository:
+To add private repositories, create a `SUBMODULE_TOKEN` Actions secret in the collection repository. For a host that does not accept `x-access-token` as the HTTPS username, also create `SUBMODULE_TOKEN_USERNAME` with the required username:
 
 ```text
 Settings → Secrets and variables → Actions → New repository secret
@@ -305,21 +328,26 @@ Recommended permissions:
 - Do not grant write access to the collection repository.
 - Use the shortest practical expiration period.
 
-The token is used only to inspect, add, and manually update target submodules. Branches in the collection repository are pushed with the default `GITHUB_TOKEN`.
+The token is used only after a write-authorized `/approve` to revalidate and add a target submodule, and during a manual update, on `authenticated_hosts`. Public issue previews never receive this token, so a private repository can appear unreachable until an authorized collaborator approves it. Target Git commands explicitly discard the collection checkout credential before applying this token. Branches in the collection repository are pushed with the default `GITHUB_TOKEN`.
 
 ## Validation Rules
 
 A request must satisfy all of the following:
 
 - Use an HTTPS repository on an allowed host
+- Use the host's default HTTPS port
 - Point to an accessible repository
 - Reference an existing branch when a branch is specified
+- Include the checked confirmation from the Issue Form
 - Use a relative path
 - Contain no `.` or `..` path segments
 - Avoid paths inside `.git`
 - Contain no control characters or line breaks
-- Not duplicate a repository or path already registered in `.gitmodules`
-- Not collide with an existing file-system path
+- Not duplicate an equivalent HTTPS, SSH, or scp-style repository already registered in `.gitmodules`
+- Not collide with tracked paths on case-insensitive file systems
+- Not traverse a symbolic link in an existing parent path
+
+Approval binds the inspected branch and commit to the gitlink staged in the pull request. If the remote moves after inspection, the workflow checks out the inspected commit or fails without pushing a pull request.
 
 User input is never concatenated into a shell command. After validation, the Node.js script passes values as separate arguments through `child_process`.
 
@@ -362,7 +390,7 @@ The badge at the top of this README uses a relative link, so renaming the templa
 - Pull requests created by the workflow are never merged automatically.
 - Editing a request issue refreshes its preview comment.
 - The latest issue content is validated again when `/approve` is submitted.
-- If an automation branch already exists for the same issue, another pull request is not created.
+- If the issue's automation branch already has a pull request, another one is not created. An orphan branch without a pull request is preserved, and the retry uses a new run-specific branch.
 - Pull requests created with the default `GITHUB_TOKEN` may not trigger other workflows. Use a GitHub App or another token if additional CI must run after pull-request creation.
 
 ## License

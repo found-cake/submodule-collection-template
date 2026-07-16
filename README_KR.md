@@ -76,6 +76,8 @@ Settings → General → Features → Issues
 
 `Issues`가 꺼져 있다면 활성화합니다.
 
+관리형 컬렉션 저장소라면 `Issues` 옆 드롭다운에서 `Collaborators only`를 선택하는 것을 권장합니다. 외부 사용자가 요청 이슈를 생성하여 미리보기 워크플로를 실행하는 것을 막을 수 있습니다. 이 제한은 서브모듈 요청 폼뿐 아니라 저장소의 모든 신규 이슈에 적용됩니다. 자세한 내용은 [GitHub Issues 설정 문서](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/disabling-issues)를 참고하세요.
+
 ### 3. GitHub Actions 쓰기 권한 설정
 
 다음 위치로 이동합니다.
@@ -105,6 +107,7 @@ Issues → New issue → Add a submodule
 | Parent path | 예 | 서브모듈이 들어갈 상위 디렉터리. 루트는 `.` |
 | Directory name | 아니요 | 비워 두면 저장소 이름 사용 |
 | Branch | 아니요 | 비워 두면 대상 저장소의 기본 브랜치 사용 |
+| Confirmation | 예 | 저장소와 상위 경로를 검토했음을 확인 |
 
 예시 입력:
 
@@ -113,6 +116,7 @@ Repository: example/example
 Parent path: collections
 Directory name: example
 Branch: main
+Confirmation: 체크
 ```
 
 생성 예정 경로:
@@ -246,6 +250,9 @@ other-owner/example     → 거부
   "allowed_hosts": [
     "github.com"
   ],
+  "authenticated_hosts": [
+    "github.com"
+  ],
   "allow_root": true,
   "portable_paths": true,
   "prevent_duplicate_repository": true,
@@ -267,6 +274,22 @@ other-owner/example     → 거부
 ```
 
 `owner/repository` 단축 입력은 항상 `github.com`으로 해석됩니다. 다른 호스트는 전체 HTTPS URL을 입력해야 합니다.
+
+### authenticated_hosts
+
+`SUBMODULE_TOKEN`을 전달할 수 있는 `allowed_hosts`의 하위 목록입니다. 기본값에는 `github.com`만 포함됩니다. 공개 커스텀 호스트는 이 목록에 넣지 말고, 비공개 커스텀 호스트에는 해당 호스트용으로 범위가 제한된 토큰을 사용할 때만 명시적으로 추가합니다.
+
+```json
+{
+  "allowed_hosts": [
+    "github.com",
+    "git.example.com"
+  ],
+  "authenticated_hosts": [
+    "github.com"
+  ]
+}
+```
 
 ### allow_root
 
@@ -290,7 +313,7 @@ other-owner/example     → 거부
 
 기본 `GITHUB_TOKEN`은 현재 컬렉션 저장소 범위에 한정되므로 다른 비공개 저장소를 읽지 못할 수 있습니다.
 
-비공개 대상 저장소를 추가하려면 새 컬렉션 저장소에 `SUBMODULE_TOKEN` Actions secret을 등록합니다.
+비공개 대상 저장소를 추가하려면 새 컬렉션 저장소에 `SUBMODULE_TOKEN` Actions secret을 등록합니다. HTTPS 사용자 이름으로 `x-access-token`을 받지 않는 호스트라면 필요한 사용자 이름을 `SUBMODULE_TOKEN_USERNAME` secret에도 등록합니다.
 
 ```text
 Settings → Secrets and variables → Actions → New repository secret
@@ -303,21 +326,26 @@ Settings → Secrets and variables → Actions → New repository secret
 - 컬렉션 저장소에 대한 쓰기 권한은 부여하지 않기
 - 가능한 짧은 만료 기간 지정
 
-토큰은 대상 저장소의 조회, `git submodule add`, 수동 업데이트에만 사용되며, 컬렉션 저장소 브랜치 push에는 기본 `GITHUB_TOKEN`이 사용됩니다.
+토큰은 쓰기 권한자의 `/approve` 이후 대상 서브모듈을 다시 검증하고 추가할 때와 수동 업데이트를 실행할 때만 `authenticated_hosts`에 사용됩니다. 공개 이슈 미리보기에는 이 토큰을 전달하지 않으므로, 비공개 저장소는 권한 있는 협업자가 승인하기 전까지 접근 불가로 표시될 수 있습니다. 대상 Git 명령은 컬렉션 checkout 자격 증명을 명시적으로 제거한 뒤 이 토큰을 적용합니다. 컬렉션 저장소 브랜치 push에는 기본 `GITHUB_TOKEN`이 사용됩니다.
 
 ## 검증 규칙
 
 요청은 다음 조건을 통과해야 합니다.
 
 - 허용된 호스트의 HTTPS 저장소
+- 해당 호스트의 기본 HTTPS 포트 사용
 - 대상 저장소에 접근 가능
 - 지정한 브랜치가 실제로 존재
+- Issue Form의 Confirmation이 체크됨
 - 절대 경로가 아님
 - `.` 또는 `..` 경로 요소를 포함하지 않음
 - `.git` 내부 경로가 아님
 - 제어 문자나 줄바꿈을 포함하지 않음
-- `.gitmodules`에 동일 저장소나 동일 경로가 없음
-- 실제 파일 시스템에 동일 경로가 없음
+- `.gitmodules`에 동등한 HTTPS, SSH 또는 scp 형식 저장소가 없음
+- 대소문자를 구분하지 않는 파일 시스템에서 추적 경로와 충돌하지 않음
+- 기존 상위 경로의 심볼릭 링크를 통과하지 않음
+
+승인 단계에서 검사한 브랜치와 커밋은 Pull Request에 스테이징되는 gitlink에 결속됩니다. 검사 이후 원격 상태가 바뀌면 검사한 커밋을 체크아웃하거나 Pull Request를 push하지 않고 실패합니다.
 
 사용자가 입력한 값은 쉘 명령 문자열로 조합하지 않고 검증 후 Node.js `child_process`를 통해 Git 명령의 개별 인자로 전달됩니다.
 
@@ -360,7 +388,7 @@ README 상단의 배지는 현재 저장소를 기준으로 상대 링크를 사
 - Action이 생성한 PR은 자동 병합하지 않습니다.
 - 요청 이슈를 수정하면 미리보기도 갱신됩니다.
 - `/approve` 시점의 최신 이슈 내용을 다시 검증합니다.
-- 이미 같은 이슈용 자동화 브랜치가 있으면 중복 PR을 만들지 않습니다.
+- 같은 이슈용 자동화 브랜치에 이미 PR이 있으면 중복 PR을 만들지 않습니다. PR 없는 고아 브랜치는 보존하고, 재시도는 실행별 새 브랜치를 사용합니다.
 - 기본 `GITHUB_TOKEN`으로 생성한 PR의 이벤트가 다른 워크플로를 다시 실행하지 않을 수 있습니다. PR 생성 후 별도 CI 실행이 꼭 필요하다면 GitHub App 또는 별도 토큰 기반 구성을 검토해야 합니다.
 
 ## License

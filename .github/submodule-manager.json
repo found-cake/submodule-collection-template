@@ -2,6 +2,9 @@
   "allowed_hosts": [
     "github.com"
   ],
+  "authenticated_hosts": [
+    "github.com"
+  ],
   "allow_root": true,
   "portable_paths": true,
   "prevent_duplicate_repository": true,

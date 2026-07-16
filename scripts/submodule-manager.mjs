@@ -6,13 +6,21 @@
  * Runtime dependencies: Node.js standard library and Git only.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join, posix, resolve } from 'node:path';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 export const PREVIEW_MARKER = '<!-- submodule-manager-preview -->';
 export const NO_RESPONSE = '_No response_';
+export const CONFIRMATION_TEXT = 'I checked the repository and parent path for mistakes.';
 
 // Leave this list empty to allow repositories from every owner.
 // Add one or more owner names to restrict new submodules to those owners.
@@ -28,6 +36,7 @@ const WINDOWS_RESERVED_NAMES = new Set([
 
 const DEFAULT_CONFIG = Object.freeze({
   allowed_hosts: ['github.com'],
+  authenticated_hosts: ['github.com'],
   allow_root: true,
   portable_paths: true,
   prevent_duplicate_repository: true,
@@ -42,7 +51,43 @@ export class RequestError extends Error {
 }
 
 function redact(value, secret) {
-  return secret ? value.split(secret).join('***') : value;
+  if (!secret) return value;
+  return value
+    .split(secret).join('***')
+    .split(encodeURIComponent(secret)).join('***');
+}
+
+function repositoryLocation(value) {
+  const original = String(value).trim();
+  if (!original.includes('://')) {
+    const scp = original.match(/^(?:[^@/\s]+@)?([^:/\s]+):(.+)$/);
+    if (scp) {
+      const host = scp[1].toLowerCase();
+      return { host, authority: host, repositoryPath: scp[2] };
+    }
+  }
+
+  try {
+    const parsed = new URL(original);
+    if (!parsed.hostname) return null;
+    const host = parsed.hostname.toLowerCase();
+    const protocol = parsed.protocol.toLowerCase();
+    const defaultPort = new Map([
+      ['git:', '9418'],
+      ['http:', '80'],
+      ['https:', '443'],
+      ['ssh:', '22'],
+    ]).get(protocol);
+    const authority = parsed.port ? `${host}:${parsed.port}` : host;
+    return {
+      host,
+      authority,
+      identityAuthority: parsed.port && parsed.port !== defaultPort ? authority : host,
+      repositoryPath: parsed.pathname,
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function runGit(
@@ -51,7 +96,8 @@ export function runGit(
     check = true,
     timeout = 45_000,
     cwd = process.cwd(),
-    targetAuth = false,
+    targetUrls = [],
+    authenticatedHosts = [],
     env: suppliedEnv = {},
   } = {},
 ) {
@@ -61,11 +107,39 @@ export function runGit(
     GIT_TERMINAL_PROMPT: process.env.GIT_TERMINAL_PROMPT || '0',
   };
 
-  const token = targetAuth ? (env.SUBMODULE_TOKEN || '') : '';
-  if (token) {
-    env.GIT_CONFIG_COUNT = '1';
-    env.GIT_CONFIG_KEY_0 = `url.https://x-access-token:${token}@github.com/.insteadOf`;
-    env.GIT_CONFIG_VALUE_0 = 'https://github.com/';
+  const token = env.SUBMODULE_TOKEN || '';
+  const username = env.SUBMODULE_TOKEN_USERNAME || 'x-access-token';
+  const urls = Array.isArray(targetUrls) ? targetUrls : [targetUrls];
+  const targets = new Map();
+  for (const url of urls) {
+    const location = repositoryLocation(url);
+    if (location) targets.set(location.authority, location);
+  }
+  const credentialHosts = new Set(authenticatedHosts.map((host) => String(host).toLowerCase()));
+  const configEntries = [];
+  for (const { host, authority } of targets.values()) {
+    // Remove actions/checkout's origin-scoped Authorization header from target-remote commands.
+    configEntries.push([`http.https://${authority}/.extraheader`, '']);
+    if (!token || !credentialHosts.has(host)) continue;
+
+    const credentialBase = `https://${encodeURIComponent(username)}:${encodeURIComponent(token)}@${authority}/`;
+    const sourceBases = [`https://${authority}/`, `ssh://git@${authority}/`];
+    if (authority === host) sourceBases.push(`git@${host}:`);
+    for (const sourceBase of sourceBases) {
+      configEntries.push([`url.${credentialBase}.insteadOf`, sourceBase]);
+    }
+  }
+  if (configEntries.length > 0) {
+    const existingCountValue = env.GIT_CONFIG_COUNT || '0';
+    if (!/^\d+$/.test(existingCountValue)) {
+      throw new RequestError('GIT_CONFIG_COUNT must be a non-negative integer.');
+    }
+    const existingCount = Number(existingCountValue);
+    env.GIT_CONFIG_COUNT = String(existingCount + configEntries.length);
+    for (const [index, [key, value]] of configEntries.entries()) {
+      env[`GIT_CONFIG_KEY_${existingCount + index}`] = key;
+      env[`GIT_CONFIG_VALUE_${existingCount + index}`] = value;
+    }
   }
 
   const result = spawnSync('git', args, {
@@ -118,10 +192,13 @@ export function loadConfig(path) {
   const config = {
     ...DEFAULT_CONFIG,
     allowed_hosts: [...DEFAULT_CONFIG.allowed_hosts],
+    authenticated_hosts: [...DEFAULT_CONFIG.authenticated_hosts],
   };
 
+  let authenticatedHostsSupplied = false;
   if (existsSync(path)) {
     const supplied = loadJson(path);
+    authenticatedHostsSupplied = Object.hasOwn(supplied, 'authenticated_hosts');
     const unknown = Object.keys(supplied)
       .filter((key) => !Object.hasOwn(DEFAULT_CONFIG, key))
       .sort();
@@ -131,10 +208,44 @@ export function loadConfig(path) {
     Object.assign(config, supplied);
   }
 
-  if (!Array.isArray(config.allowed_hosts) || config.allowed_hosts.length === 0) {
-    throw new RequestError('allowed_hosts must be a non-empty JSON array');
+  const normalizeHosts = (value, key, allowEmpty) => {
+    if (!Array.isArray(value) || (!allowEmpty && value.length === 0)) {
+      throw new RequestError(`${key} must be ${allowEmpty ? 'a' : 'a non-empty'} JSON array`);
+    }
+    const hosts = value.map((host) => String(host).trim().toLowerCase());
+    for (const host of hosts) {
+      let parsed;
+      try {
+        parsed = new URL(`https://${host}`);
+      } catch {
+        throw new RequestError(`${key} contains an invalid hostname: ${host || '(empty)'}`);
+      }
+      if (!host || parsed.hostname.toLowerCase() !== host || parsed.port || parsed.pathname !== '/') {
+        throw new RequestError(`${key} contains an invalid hostname: ${host || '(empty)'}`);
+      }
+    }
+    if (new Set(hosts).size !== hosts.length) {
+      throw new RequestError(`${key} must not contain duplicate hostnames`);
+    }
+    return hosts;
+  };
+
+  config.allowed_hosts = normalizeHosts(config.allowed_hosts, 'allowed_hosts', false);
+  if (!authenticatedHostsSupplied) {
+    config.authenticated_hosts = config.authenticated_hosts.filter(
+      (host) => config.allowed_hosts.includes(host),
+    );
   }
-  config.allowed_hosts = config.allowed_hosts.map((host) => String(host).trim().toLowerCase());
+  config.authenticated_hosts = normalizeHosts(
+    config.authenticated_hosts,
+    'authenticated_hosts',
+    true,
+  );
+  for (const host of config.authenticated_hosts) {
+    if (!config.allowed_hosts.includes(host)) {
+      throw new RequestError(`authenticated host '${host}' must also appear in allowed_hosts`);
+    }
+  }
 
   for (const key of [
     'allow_root',
@@ -172,6 +283,18 @@ export function parseIssueBody(body) {
   if (!result.Repository) {
     throw new RequestError('Repository is required.');
   }
+  const confirmation = body.match(
+    /^### Confirmation\s*\n+([\s\S]*?)(?=\n### |$)/m,
+  );
+  if (!confirmation) {
+    throw new RequestError('Missing Issue Form field: Confirmation');
+  }
+  const checkedConfirmation = new RegExp(
+    `^-\\s+\\[[xX]\\]\\s+${escapeRegExp(CONFIRMATION_TEXT)}$`,
+  );
+  if (!confirmation[1].split('\n').some((line) => checkedConfirmation.test(line.trim()))) {
+    throw new RequestError('Confirmation must be checked.');
+  }
   return result;
 }
 
@@ -202,6 +325,9 @@ export function normalizeRepository(value, allowedHosts, whitelistOwners = white
   if (parsed.protocol.toLowerCase() !== 'https:') {
     throw new RequestError('Repository must use an HTTPS URL or the owner/repository shorthand.');
   }
+  if (parsed.port) {
+    throw new RequestError('Repository URLs must not use a non-default port.');
+  }
   if (parsed.username || parsed.password || parsed.search || parsed.hash) {
     throw new RequestError('Repository URL must not contain credentials, a query, or a fragment.');
   }
@@ -214,7 +340,7 @@ export function normalizeRepository(value, allowedHosts, whitelistOwners = white
   }
 
   let repositoryPath = parsed.pathname.replace(/^\/+|\/+$/g, '');
-  if (repositoryPath.endsWith('.git')) {
+  if (/\.git$/i.test(repositoryPath)) {
     repositoryPath = repositoryPath.slice(0, -4);
   }
   const parts = repositoryPath ? repositoryPath.split('/') : [];
@@ -321,21 +447,19 @@ export function validateBranch(value) {
 }
 
 export function repositoryKey(url) {
-  let parsed;
-  try {
-    parsed = new URL(url);
-  } catch {
+  const location = repositoryLocation(url);
+  if (!location) {
     return String(url).replace(/\.git$/i, '').toLowerCase();
   }
-  const host = parsed.hostname.toLowerCase();
-  let repositoryPath = parsed.pathname.replace(/^\/+|\/+$/g, '');
-  if (repositoryPath.endsWith('.git')) {
+  const host = location.host;
+  let repositoryPath = location.repositoryPath.replace(/^\/+|\/+$/g, '');
+  if (/\.git$/i.test(repositoryPath)) {
     repositoryPath = repositoryPath.slice(0, -4);
   }
   if (host === 'github.com') {
     repositoryPath = repositoryPath.toLowerCase();
   }
-  return `${host}/${repositoryPath}`;
+  return `${location.identityAuthority || location.authority}/${repositoryPath}`;
 }
 
 function configValues(root, suffix) {
@@ -365,6 +489,78 @@ export function readGitmodules(root) {
     urls: configValues(root, 'url'),
     paths: configValues(root, 'path'),
   };
+}
+
+function listTrackedPaths(root) {
+  const result = runGit(['ls-files', '-z', '--cached'], { check: false, cwd: root });
+  if (result.returncode !== 0) {
+    throw new RequestError(result.stderr.trim() || 'Failed to list tracked paths.');
+  }
+  return result.stdout.split('\0').filter(Boolean);
+}
+
+function portableCaseFold(value) {
+  return value.normalize('NFKC').toUpperCase().toLowerCase().normalize('NFC');
+}
+
+function pathsConflictOnCaseInsensitiveFileSystem(existingPath, targetPath) {
+  const existingParts = existingPath.normalize('NFC').split('/');
+  const targetParts = targetPath.normalize('NFC').split('/');
+  const sharedLength = Math.min(existingParts.length, targetParts.length);
+  for (let index = 0; index < sharedLength; index += 1) {
+    const existingPart = existingParts[index];
+    const targetPart = targetParts[index];
+    if (portableCaseFold(existingPart) !== portableCaseFold(targetPart)) return false;
+    if (existingPart !== targetPart) return true;
+  }
+  return true;
+}
+
+function assertSafeTargetPath(root, targetPath, existingSubmodulePaths, caseInsensitive) {
+  const trackedPaths = listTrackedPaths(root);
+  for (const existingPath of [...existingSubmodulePaths, ...trackedPaths]) {
+    if (existingPath === targetPath) {
+      throw new RequestError('The target path already exists in the repository.');
+    }
+    if (
+      caseInsensitive
+      && pathsConflictOnCaseInsensitiveFileSystem(existingPath, targetPath)
+    ) {
+      throw new RequestError(
+        `The target path conflicts with tracked path '${existingPath}' on a case-insensitive file system.`,
+      );
+    }
+  }
+
+  try {
+    lstatSync(join(root, ...targetPath.split('/')));
+    throw new RequestError('The target path already exists in the repository.');
+  } catch (error) {
+    if (error instanceof RequestError) throw error;
+    if (error?.code !== 'ENOENT') {
+      throw new RequestError(`Failed to inspect the target path: ${error.message}`);
+    }
+  }
+}
+
+function assertSafeParentDirectories(root, targetPath) {
+  let current = root;
+  for (const part of targetPath.split('/').slice(0, -1)) {
+    current = join(current, part);
+    let metadata;
+    try {
+      metadata = lstatSync(current);
+    } catch (error) {
+      if (error?.code === 'ENOENT') break;
+      throw new RequestError(`Failed to inspect target parent '${part}': ${error.message}`);
+    }
+    if (metadata.isSymbolicLink()) {
+      throw new RequestError('Target path parents must not contain symbolic links.');
+    }
+    if (!metadata.isDirectory()) {
+      throw new RequestError('Every existing target path parent must be a directory.');
+    }
+  }
 }
 
 export function listSubmodules(root) {
@@ -473,15 +669,19 @@ export function workingTreeCommit(root, path) {
   return commit;
 }
 
-export function updateSubmodules(root, requestedPath) {
+export function updateSubmodules(root, requestedPath, authenticatedHosts = ['github.com']) {
   const selected = selectSubmodules(root, requestedPath);
   const paths = selected.map((submodule) => submodule.path);
   const before = new Map(selected.map((submodule) => [submodule.path, gitlinkCommit(root, submodule.path)]));
 
-  runGit(['submodule', 'sync', '--', ...paths], { cwd: root, targetAuth: true });
+  const targetUrls = selected.map((submodule) => submodule.url);
+  runGit(
+    ['submodule', 'sync', '--', ...paths],
+    { cwd: root, targetUrls, authenticatedHosts },
+  );
   runGit(
     ['submodule', 'update', '--init', '--remote', '--checkout', '--', ...paths],
-    { cwd: root, targetAuth: true, timeout: 900_000 },
+    { cwd: root, targetUrls, authenticatedHosts, timeout: 900_000 },
   );
 
   const changes = [];
@@ -501,10 +701,21 @@ export function updateSubmodules(root, requestedPath) {
   return { selected, changes };
 }
 
-export function inspectRemote(repositoryUrl, branch) {
+function remoteCommit(output, ref) {
+  for (const line of output.split('\n')) {
+    const separator = line.indexOf('\t');
+    if (separator === -1 || line.slice(separator + 1) !== ref) continue;
+    const commit = line.slice(0, separator);
+    if (/^[0-9a-fA-F]{40,64}$/.test(commit)) return commit;
+  }
+  return '';
+}
+
+export function inspectRemote(repositoryUrl, branch, authenticatedHosts = ['github.com']) {
   const result = runGit(['ls-remote', '--symref', repositoryUrl, 'HEAD'], {
     check: false,
-    targetAuth: true,
+    targetUrls: repositoryUrl,
+    authenticatedHosts,
   });
   if (result.returncode !== 0) {
     const lines = result.stderr.trim().split('\n').filter(Boolean);
@@ -526,13 +737,21 @@ export function inspectRemote(repositoryUrl, branch) {
   if (branch) {
     const branchResult = runGit(
       ['ls-remote', '--exit-code', '--heads', repositoryUrl, `refs/heads/${branch}`],
-      { check: false, targetAuth: true },
+      { check: false, targetUrls: repositoryUrl, authenticatedHosts },
     );
     if (branchResult.returncode !== 0) {
       throw new RequestError(`Branch '${branch}' does not exist in the target repository.`);
     }
+    const commit = remoteCommit(branchResult.stdout, `refs/heads/${branch}`);
+    if (!commit) throw new RequestError(`Failed to resolve branch '${branch}'.`);
+    return { defaultBranch, selectedBranch: branch, commit };
   }
-  return defaultBranch;
+
+  const commit = remoteCommit(result.stdout, 'HEAD');
+  if (!defaultBranch || !commit) {
+    throw new RequestError('The remote default branch could not be resolved.');
+  }
+  return { defaultBranch, selectedBranch: defaultBranch, commit };
 }
 
 export function inspectRequest({
@@ -568,7 +787,9 @@ export function inspectRequest({
   );
   const branch = validateBranch(fields.Branch);
   const targetPath = parentPath ? posix.join(parentPath, directoryName) : directoryName;
-  const remoteDefaultBranch = skipRemoteCheck ? '' : inspectRemote(repositoryUrl, branch);
+  const remote = skipRemoteCheck
+    ? { defaultBranch: '', selectedBranch: branch, commit: '' }
+    : inspectRemote(repositoryUrl, branch, config.authenticated_hosts);
 
   const { urls: existingUrls, paths: existingPaths } = readGitmodules(absoluteRoot);
   if (config.prevent_duplicate_repository) {
@@ -578,21 +799,13 @@ export function inspectRequest({
     }
   }
 
-  const comparableTarget = config.prevent_case_insensitive_path
-    ? targetPath.toLowerCase()
-    : targetPath;
-  for (const existingPath of existingPaths) {
-    const comparableExisting = config.prevent_case_insensitive_path
-      ? existingPath.toLowerCase()
-      : existingPath;
-    if (comparableExisting === comparableTarget) {
-      throw new RequestError('The target path is already registered in .gitmodules.');
-    }
-  }
-
-  if (existsSync(join(absoluteRoot, ...targetPath.split('/')))) {
-    throw new RequestError('The target path already exists in the repository.');
-  }
+  assertSafeTargetPath(
+    absoluteRoot,
+    targetPath,
+    existingPaths,
+    config.prevent_case_insensitive_path,
+  );
+  assertSafeParentDirectories(absoluteRoot, targetPath);
 
   return {
     repository_input: fields.Repository,
@@ -602,7 +815,10 @@ export function inspectRequest({
     directory_name: directoryName,
     target_path: targetPath,
     branch,
-    remote_default_branch: remoteDefaultBranch,
+    remote_default_branch: remote.defaultBranch,
+    resolved_branch: remote.selectedBranch,
+    resolved_commit: remote.commit,
+    remote_verified: !skipRemoteCheck,
   };
 }
 
@@ -612,7 +828,7 @@ export function previewMarkdown(request, error) {
     lines.push(
       '❌ **Validation failed**',
       '',
-      `> ${error}`,
+      `> ${code(error)}`,
       '',
       'Edit the issue to correct the request. The preview will update automatically.',
     );
@@ -625,9 +841,9 @@ export function previewMarkdown(request, error) {
     '',
     '| Item | Value |',
     '| --- | --- |',
-    `| Repository | \`${request.repository_url}\` |`,
-    `| Target path | \`${request.target_path}\` |`,
-    `| Branch | \`${selectedBranch}\` |`,
+    `| Repository | ${code(request.repository_url)} |`,
+    `| Target path | ${code(request.target_path)} |`,
+    `| Branch | ${code(selectedBranch)} |`,
     '',
     'A repository collaborator with write access can create the pull request by commenting:',
     '',
@@ -640,17 +856,28 @@ export function previewMarkdown(request, error) {
   return `${lines.join('\n')}\n`;
 }
 
-function htmlEscape(value) {
-  return String(value)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#x27;');
+function code(value) {
+  const encoded = [...String(value)]
+    .map((character) => `&#${character.codePointAt(0)};`)
+    .join('');
+  return `<code>${encoded}</code>`;
 }
 
-function code(value) {
-  return `<code>${htmlEscape(value)}</code>`;
+export function approvalMarkdown(request, issueNumber) {
+  const issue = String(issueNumber);
+  if (!/^[1-9]\d*$/.test(issue)) {
+    throw new RequestError('Issue number must be a positive integer.');
+  }
+  const selectedBranch = request.branch || request.remote_default_branch || 'remote default branch';
+  return `${[
+    '## Submodule request',
+    '',
+    `- Repository: ${code(request.repository_url)}`,
+    `- Target path: ${code(request.target_path)}`,
+    `- Branch: ${code(selectedBranch)}`,
+    '',
+    `Closes #${issue}`,
+  ].join('\n')}\n`;
 }
 
 export function updateMarkdown(selected, changes, requestedPath) {
@@ -690,24 +917,65 @@ export function writeJson(path, value) {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
 }
 
+const COMMAND_OPTIONS = Object.freeze({
+  inspect: Object.freeze({
+    booleans: new Set(['skip_remote_check', 'strict']),
+    values: new Set(['event', 'output', 'markdown', 'config', 'root']),
+  }),
+  apply: Object.freeze({
+    booleans: new Set(),
+    values: new Set(['request', 'config', 'root']),
+  }),
+  'github-output': Object.freeze({
+    booleans: new Set(),
+    values: new Set(['request', 'issue', 'markdown']),
+  }),
+  update: Object.freeze({
+    booleans: new Set(),
+    values: new Set(['path', 'output', 'markdown', 'config', 'root']),
+  }),
+  'update-output': Object.freeze({
+    booleans: new Set(),
+    values: new Set(['result']),
+  }),
+  'stage-update': Object.freeze({
+    booleans: new Set(),
+    values: new Set(['result', 'root']),
+  }),
+});
+
 function parseCli(argv) {
   const [command, ...tokens] = argv;
   if (!command) throw new RequestError('A command is required.');
+  const schema = Object.hasOwn(COMMAND_OPTIONS, command) ? COMMAND_OPTIONS[command] : null;
+  if (!schema) throw new RequestError(`Unknown command: ${command}`);
 
-  const options = {};
+  const options = Object.create(null);
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
     if (!token.startsWith('--')) {
       throw new RequestError(`Unexpected argument: ${token}`);
     }
-    const key = token.slice(2).replaceAll('-', '_');
-    const next = tokens[index + 1];
-    if (next === undefined || next.startsWith('--')) {
-      options[key] = true;
-    } else {
-      options[key] = next;
-      index += 1;
+    if (token.includes('=')) {
+      throw new RequestError(`Option values must be separate arguments: ${token}`);
     }
+    const key = token.slice(2).replaceAll('-', '_');
+    if (!schema.booleans.has(key) && !schema.values.has(key)) {
+      throw new RequestError(`Unknown option for ${command}: ${token}`);
+    }
+    if (Object.hasOwn(options, key)) {
+      throw new RequestError(`Option may only be specified once: ${token}`);
+    }
+    if (schema.booleans.has(key)) {
+      options[key] = true;
+      continue;
+    }
+    const next = tokens[index + 1];
+    if (next === undefined) {
+      throw new RequestError(`Option requires a value: ${token}`);
+    }
+    options[key] = next;
+    index += 1;
   }
   return { command, options };
 }
@@ -728,7 +996,7 @@ function commandInspect(options) {
       eventPath: required(options, 'event'),
       configPath: options.config || '.github/submodule-manager.json',
       root: options.root || '.',
-      skipRemoteCheck: Boolean(options.skip_remote_check),
+      skipRemoteCheck: options.skip_remote_check === true,
     });
   } catch (caught) {
     error = caught instanceof Error ? caught.message : String(caught);
@@ -742,31 +1010,121 @@ function commandInspect(options) {
   writeJson(required(options, 'output'), result);
   writeFileSync(required(options, 'markdown'), previewMarkdown(request, error), 'utf8');
 
-  if (options.strict && error) {
+  if (options.strict === true && error) {
     throw new RequestError(error);
   }
 }
 
+function validatedRequestResolution(request) {
+  if (request === null || Array.isArray(request) || typeof request !== 'object') {
+    throw new RequestError('Request metadata is missing.');
+  }
+  const branch = validateBranch(request.branch || '');
+  const remoteDefaultBranch = validateBranch(request.remote_default_branch || '');
+  const resolvedBranch = validateBranch(request.resolved_branch || '');
+  const resolvedCommit = String(request.resolved_commit || '').toLowerCase();
+  if (request.remote_verified !== true) {
+    throw new RequestError('Request metadata was not verified against the remote repository.');
+  }
+  if (!resolvedBranch || resolvedBranch !== (branch || remoteDefaultBranch)) {
+    throw new RequestError('Validated branch metadata is missing or inconsistent.');
+  }
+  if (!/^[0-9a-f]{40,64}$/.test(resolvedCommit)) {
+    throw new RequestError('Validated commit metadata is missing or invalid.');
+  }
+  return { branch, remoteDefaultBranch, resolvedBranch, resolvedCommit };
+}
+
 function commandApply(options) {
   const root = resolve(options.root || '.');
+  const config = loadConfig(options.config || '.github/submodule-manager.json');
   const result = loadJson(required(options, 'request'));
   if (!result.valid) {
     throw new RequestError(result.error || 'Request is invalid.');
   }
   const request = result.request;
-  if (request === null || Array.isArray(request) || typeof request !== 'object') {
-    throw new RequestError('Request metadata is missing.');
+  const { branch, resolvedCommit } = validatedRequestResolution(request);
+
+  const suppliedRepositoryUrl = String(request.repository_url || '');
+  const { repositoryUrl } = normalizeRepository(
+    suppliedRepositoryUrl,
+    config.allowed_hosts,
+  );
+  if (repositoryUrl !== suppliedRepositoryUrl) {
+    throw new RequestError('Request repository metadata is not normalized.');
   }
 
-  const repositoryUrl = String(request.repository_url);
-  const targetPath = String(request.target_path);
-  const branch = String(request.branch || '');
-  mkdirSync(dirname(join(root, ...targetPath.split('/'))), { recursive: true });
+  const suppliedTargetPath = String(request.target_path || '');
+  const targetPath = suppliedTargetPath
+    .split('/')
+    .map((part) => validateSegment(part, 'Target path segment', config.portable_paths))
+    .join('/');
+  if (!targetPath || targetPath !== suppliedTargetPath) {
+    throw new RequestError('Request target path metadata is not normalized.');
+  }
+
+  const { urls: existingUrls, paths: existingPaths } = readGitmodules(root);
+  if (
+    config.prevent_duplicate_repository
+    && existingUrls.some((url) => repositoryKey(url) === repositoryKey(repositoryUrl))
+  ) {
+    throw new RequestError('The same repository is already registered in .gitmodules.');
+  }
+  assertSafeTargetPath(
+    root,
+    targetPath,
+    existingPaths,
+    config.prevent_case_insensitive_path,
+  );
+  assertSafeParentDirectories(root, targetPath);
+  const targetParent = dirname(join(root, ...targetPath.split('/')));
+  mkdirSync(targetParent, { recursive: true });
+  const relativeParent = relative(realpathSync(root), realpathSync(targetParent));
+  if (
+    isAbsolute(relativeParent)
+    || relativeParent === '..'
+    || relativeParent.startsWith(`..${sep}`)
+  ) {
+    throw new RequestError('The target path parent resolves outside the repository.');
+  }
 
   const command = ['submodule', 'add'];
   if (branch) command.push('-b', branch);
   command.push('--', repositoryUrl, targetPath);
-  runGit(command, { cwd: root, targetAuth: true });
+  runGit(command, {
+    cwd: root,
+    targetUrls: repositoryUrl,
+    authenticatedHosts: config.authenticated_hosts,
+  });
+
+  const commitExists = runGit(
+    ['-C', targetPath, 'cat-file', '-e', `${resolvedCommit}^{commit}`],
+    { check: false, cwd: root },
+  );
+  if (commitExists.returncode !== 0) {
+    const fetched = runGit(
+      ['-C', targetPath, 'fetch', '--no-tags', 'origin', resolvedCommit],
+      {
+        check: false,
+        cwd: root,
+        targetUrls: repositoryUrl,
+        authenticatedHosts: config.authenticated_hosts,
+      },
+    );
+    if (fetched.returncode !== 0) {
+      throw new RequestError('The validated remote commit is no longer available.');
+    }
+  }
+
+  runGit(['-C', targetPath, 'checkout', '--detach', resolvedCommit], { cwd: root });
+  if (workingTreeCommit(root, targetPath).toLowerCase() !== resolvedCommit) {
+    throw new RequestError('The applied submodule commit does not match the validated commit.');
+  }
+  runGit(['add', '--', targetPath], { cwd: root });
+  const staged = runGit(['ls-files', '--stage', '--', targetPath], { cwd: root }).stdout;
+  if (!staged.startsWith(`160000 ${resolvedCommit} `)) {
+    throw new RequestError('The staged gitlink does not match the validated commit.');
+  }
 }
 
 function commandGithubOutput(options) {
@@ -774,23 +1132,37 @@ function commandGithubOutput(options) {
   if (!result.valid) {
     throw new RequestError(result.error || 'Request is invalid.');
   }
+  validatedRequestResolution(result.request);
+  const markdownPath = required(options, 'markdown');
+  const markdown = approvalMarkdown(result.request, required(options, 'issue'));
+  const outputs = [];
   for (const key of [
     'repository_url',
     'repository_name',
     'target_path',
     'branch',
     'remote_default_branch',
+    'resolved_branch',
+    'resolved_commit',
   ]) {
     const value = String(result.request?.[key] || '');
     validateNoControls(value, key);
-    process.stdout.write(`${key}=${value}\n`);
+    outputs.push(`${key}=${value}`);
   }
+  mkdirSync(dirname(markdownPath), { recursive: true });
+  writeFileSync(markdownPath, markdown, 'utf8');
+  process.stdout.write(`${outputs.join('\n')}\n`);
 }
 
 function commandUpdate(options) {
   const root = resolve(options.root || '.');
+  const config = loadConfig(options.config || '.github/submodule-manager.json');
   const requestedPath = typeof options.path === 'string' ? options.path : '';
-  const { selected, changes } = updateSubmodules(root, requestedPath);
+  const { selected, changes } = updateSubmodules(
+    root,
+    requestedPath,
+    config.authenticated_hosts,
+  );
   const result = {
     changed: changes.length > 0,
     requested_path: requestedPath.trim(),

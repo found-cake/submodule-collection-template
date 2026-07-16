@@ -48,23 +48,27 @@ jobs:
           esac
 
       - name: Check out the default branch
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
 
       - name: Revalidate current request
+        id: revalidate
         env:
           SUBMODULE_TOKEN: ${{ secrets.SUBMODULE_TOKEN }}
+          SUBMODULE_TOKEN_USERNAME: ${{ secrets.SUBMODULE_TOKEN_USERNAME }}
         run: |
           node scripts/submodule-manager.mjs inspect \
             --event "$GITHUB_EVENT_PATH" \
             --output "$RUNNER_TEMP/submodule-request.json" \
-            --markdown "$RUNNER_TEMP/submodule-preview.md"
+            --markdown "$RUNNER_TEMP/submodule-preview.md" \
+            --strict
 
           cat "$RUNNER_TEMP/submodule-preview.md"
 
       - name: Update preview comment
+        if: always() && steps.revalidate.outcome != 'skipped'
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
@@ -89,7 +93,9 @@ jobs:
         id: request
         run: |
           node scripts/submodule-manager.mjs github-output \
-            --request "$RUNNER_TEMP/submodule-request.json" >> "$GITHUB_OUTPUT"
+            --request "$RUNNER_TEMP/submodule-request.json" \
+            --issue "${{ github.event.issue.number }}" \
+            --markdown "$RUNNER_TEMP/pull-request-body.md" >> "$GITHUB_OUTPUT"
 
       - name: Check for an existing automation branch
         id: existing
@@ -98,25 +104,34 @@ jobs:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           PR_BRANCH="submodule/issue-${ISSUE_NUMBER}"
-          echo "branch=$PR_BRANCH" >> "$GITHUB_OUTPUT"
+          PR_URL="$(
+            gh pr list --state all --limit 1000 \
+              --json url,headRefName \
+              --jq ".[] | select(.headRefName == \"${PR_BRANCH}\" or (.headRefName | startswith(\"${PR_BRANCH}-retry-\"))) | .url" \
+              | head -n 1
+          )"
 
-          if git ls-remote --exit-code --heads origin "$PR_BRANCH" >/dev/null 2>&1; then
-            PR_URL="$(
-              gh pr list --state all --head "$PR_BRANCH" \
-                --json url --jq '.[0].url // empty'
-            )"
-
-            if [ -n "$PR_URL" ]; then
-              gh issue comment "$ISSUE_NUMBER" \
-                --body "ℹ️ A pull request for this issue already exists: ${PR_URL}" >/dev/null
-            else
-              gh issue comment "$ISSUE_NUMBER" \
-                --body "❌ The automation branch \`${PR_BRANCH}\` already exists without a pull request. Delete or rename it before approving again." >/dev/null
-            fi
-
+          if [ -n "$PR_URL" ]; then
+            gh issue comment "$ISSUE_NUMBER" \
+              --body "ℹ️ A pull request for this issue already exists: ${PR_URL}" >/dev/null
+            echo "branch=$PR_BRANCH" >> "$GITHUB_OUTPUT"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+            BRANCH_SHA="$(
+              git ls-remote --heads origin "refs/heads/${PR_BRANCH}" \
+                | awk 'NR == 1 { print $1 }'
+            )"
+
+            if [ -n "$BRANCH_SHA" ]; then
+              RETRY_BRANCH="${PR_BRANCH}-retry-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+              gh issue comment "$ISSUE_NUMBER" \
+                --body "ℹ️ Preserving orphan branch \`${PR_BRANCH}\` and retrying with \`${RETRY_BRANCH}\`." >/dev/null
+              echo "branch=$RETRY_BRANCH" >> "$GITHUB_OUTPUT"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "branch=$PR_BRANCH" >> "$GITHUB_OUTPUT"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
       - name: Add submodule
@@ -124,6 +139,7 @@ jobs:
         env:
           PR_BRANCH: ${{ steps.existing.outputs.branch }}
           SUBMODULE_TOKEN: ${{ secrets.SUBMODULE_TOKEN }}
+          SUBMODULE_TOKEN_USERNAME: ${{ secrets.SUBMODULE_TOKEN_USERNAME }}
         run: |
           git switch -c "$PR_BRANCH"
           node scripts/submodule-manager.mjs apply \
@@ -144,7 +160,7 @@ jobs:
           git add -- .gitmodules "$TARGET_PATH"
           git commit -m "chore: add ${REPOSITORY_NAME} submodule" \
             -m "Requested in #${ISSUE_NUMBER}."
-          git push origin "$PR_BRANCH"
+          git push origin "HEAD:refs/heads/${PR_BRANCH}"
 
       - name: Create pull request
         if: steps.existing.outputs.skip == 'false'
@@ -153,25 +169,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_BRANCH: ${{ steps.existing.outputs.branch }}
           BASE_BRANCH: ${{ github.event.repository.default_branch }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          TARGET_PATH: ${{ steps.request.outputs.target_path }}
-          REPOSITORY_URL: ${{ steps.request.outputs.repository_url }}
           REPOSITORY_NAME: ${{ steps.request.outputs.repository_name }}
-          REQUESTED_BRANCH: ${{ steps.request.outputs.branch }}
-          DEFAULT_BRANCH: ${{ steps.request.outputs.remote_default_branch }}
         run: |
-          SELECTED_BRANCH="${REQUESTED_BRANCH:-${DEFAULT_BRANCH:-remote default branch}}"
-
-          cat > "$RUNNER_TEMP/pull-request-body.md" <<EOF
-          ## Submodule request
-
-          - Repository: \`${REPOSITORY_URL}\`
-          - Target path: \`${TARGET_PATH}\`
-          - Branch: \`${SELECTED_BRANCH}\`
-
-          Closes #${ISSUE_NUMBER}
-          EOF
-
           PR_URL="$(
             gh pr create \
               --head "$PR_BRANCH" \
