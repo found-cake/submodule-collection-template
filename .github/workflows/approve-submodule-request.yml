@@ -59,7 +59,7 @@ jobs:
           SUBMODULE_TOKEN: ${{ secrets.SUBMODULE_TOKEN }}
           SUBMODULE_TOKEN_USERNAME: ${{ secrets.SUBMODULE_TOKEN_USERNAME }}
         run: |
-          node scripts/submodule-manager.mjs inspect \
+          node .github/scripts/submodule-manager.mjs inspect \
             --event "$GITHUB_EVENT_PATH" \
             --output "$RUNNER_TEMP/submodule-request.json" \
             --markdown "$RUNNER_TEMP/submodule-preview.md" \
@@ -92,7 +92,7 @@ jobs:
       - name: Export validated request
         id: request
         run: |
-          node scripts/submodule-manager.mjs github-output \
+          node .github/scripts/submodule-manager.mjs github-output \
             --request "$RUNNER_TEMP/submodule-request.json" \
             --issue "${{ github.event.issue.number }}" \
             --markdown "$RUNNER_TEMP/pull-request-body.md" >> "$GITHUB_OUTPUT"
@@ -142,7 +142,7 @@ jobs:
           SUBMODULE_TOKEN_USERNAME: ${{ secrets.SUBMODULE_TOKEN_USERNAME }}
         run: |
           git switch -c "$PR_BRANCH"
-          node scripts/submodule-manager.mjs apply \
+          node .github/scripts/submodule-manager.mjs apply \
             --request "$RUNNER_TEMP/submodule-request.json"
 
       - name: Commit and push

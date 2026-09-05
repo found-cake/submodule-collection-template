@@ -30,7 +30,7 @@ jobs:
 
       - name: Validate request
         run: |
-          node scripts/submodule-manager.mjs inspect \
+          node .github/scripts/submodule-manager.mjs inspect \
             --event "$GITHUB_EVENT_PATH" \
             --output "$RUNNER_TEMP/submodule-request.json" \
             --markdown "$RUNNER_TEMP/submodule-preview.md"

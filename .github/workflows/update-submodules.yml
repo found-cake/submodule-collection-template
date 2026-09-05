@@ -33,7 +33,7 @@ jobs:
           SUBMODULE_TOKEN: ${{ secrets.SUBMODULE_TOKEN }}
           SUBMODULE_TOKEN_USERNAME: ${{ secrets.SUBMODULE_TOKEN_USERNAME }}
         run: |
-          node scripts/submodule-manager.mjs update \
+          node .github/scripts/submodule-manager.mjs update \
             --path "$REQUESTED_PATH" \
             --output "$RUNNER_TEMP/submodule-update.json" \
             --markdown "$RUNNER_TEMP/submodule-update.md"
@@ -43,7 +43,7 @@ jobs:
       - name: Read update result
         id: result
         run: |
-          node scripts/submodule-manager.mjs update-output \
+          node .github/scripts/submodule-manager.mjs update-output \
             --result "$RUNNER_TEMP/submodule-update.json" >> "$GITHUB_OUTPUT"
 
       - name: Stop when everything is current
@@ -61,7 +61,7 @@ jobs:
       - name: Stage updated gitlinks
         if: steps.result.outputs.changed == 'true'
         run: |
-          node scripts/submodule-manager.mjs stage-update \
+          node .github/scripts/submodule-manager.mjs stage-update \
             --result "$RUNNER_TEMP/submodule-update.json"
 
       - name: Commit and push
